@@ -72,6 +72,763 @@ function New-AzsAdGraphServicePrincipal {
 
 <#
 .Synopsis
+Repairs the advertised application registrations within Azure Stack for use with the "Register-AzsWithMyDirectoryTenant" cmdlet.
+.DESCRIPTION
+Running this cmdlet will repairs the advertised application registrations within Azure Stack for use with the "Register-AzsWithMyDirectoryTenant" cmdlet.
+.EXAMPLE
+$adminARMEndpoint = "https://adminmanagement.local.azurestack.external"
+$azureStackDirectoryTenant = "<homeDirectoryTenant>.onmicrosoft.com"
+$guestDirectoryTenantToBeOnboarded = "<guestDirectoryTenant>.onmicrosoft.com"
+
+Repair-AzsApplicationRegistrations -AdminResourceManagerEndpoint $adminARMEndpoint -DirectoryTenantName $azureStackDirectoryTenant
+#>
+
+function Repair-AzsApplicationRegistrations {
+    [CmdletBinding()]
+    param
+    (
+        # The endpoint of the Azure Stack Resource Manager service.
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [ValidateScript( {$_.Scheme -eq [System.Uri]::UriSchemeHttps})]
+        [uri] $AdminResourceManagerEndpoint,
+
+        # The name of the home Directory Tenant in which the Azure Stack Administrator subscription resides.
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $DirectoryTenantName,
+
+        # The location of your Azure Stack deployment.
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Location,
+
+        # Optional: A credential used to authenticate with Azure Stack. Must support a non-interactive authentication flow. If not provided, the script will prompt for user credentials.
+        [Parameter()]
+        [ValidateNotNull()]
+        [pscredential] $AutomationCredential = $null,
+
+        # Indicates whether the script should only test if the application registration permissions are as-expected, without changing them. Run this command with "-Test:$false" to have it correct the changes it reports from running it without this modifier.
+        [Parameter()]
+        [switch] $Test = $true
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $VerbosePreference = 'Continue'
+
+    if (-not $Test) {
+        Write-Warning -WarningAction Inquire -Message "This script makes changes to the advertised application permissions within Azure Stack. This is a temporary workaround to address certain circumstances which can result in modifications to these resources within Azure Stack. Only run this script if you have been directed to do so or have an understanding of the modifications this script addresses. Are you sure you want to proceed?"
+    }
+    else {
+        Write-Warning "This script has been executed with the default parameter '-Test:`$true' which will only report if any changes are detected to application registrations which can arise in certain circumstances when running an Azure Stack update. After reviewing the changes it reports, run the script again with the parameter '-Test:`$false' to apply the changes."
+    }
+
+    # Install-Module AzureRm
+    Import-Module 'AzureRm.Profile' -Verbose:$false 4> $null
+    Import-Module "$PSScriptRoot\GraphAPI\GraphAPI.psm1" -Verbose:$false 4> $null
+
+    function Invoke-Main {
+        # Initialize the Azure PowerShell module to communicate with the Azure Resource Manager in the public cloud corresponding to the Azure Stack Graph Service. Will prompt user for credentials.
+        Write-Host "Authenticating user..."
+        $azureStackEnvironment = Initialize-AzureRmEnvironment 'AzureStackAdmin'
+        $refreshToken = Initialize-AzureRmUserAccount $azureStackEnvironment
+
+        # Initialize the Graph PowerShell module to communicate with the correct graph service
+        $graphEnvironment = Resolve-GraphEnvironment $azureStackEnvironment
+        Initialize-GraphEnvironment -Environment $graphEnvironment -DirectoryTenantId $DirectoryTenantName -RefreshToken $refreshToken
+
+        # Call Azure Stack Resource Manager to retrieve the list of registered applications which need to be initialized in the onboarding directory tenant
+        Write-Host "Acquiring an access token to communicate with Resource Manager..."
+        $armAccessToken = Get-ArmAccessToken $azureStackEnvironment
+
+        Write-Host "Looking-up the current registered identity applications..."
+        $subscription = Get-AzureRmSubscription -SubscriptionName "Default Provider Subscription" -TenantId $azureStackEnvironment.AdTenant
+        $applicationRegistrationParams = @{
+            Method  = [Microsoft.PowerShell.Commands.WebRequestMethod]::Get
+            Headers = @{ Authorization = "Bearer $armAccessToken" }
+            Uri     = "$($AdminResourceManagerEndpoint.ToString().TrimEnd('/'))/subscriptions/$($subscription.SubscriptionId)/resourceGroups/$("system.$Location")/providers/microsoft.subscriptions.providers/applicationRegistrations?api-version=2015-11-01"
+        }
+        $applicationRegistrations = Invoke-RestMethod @applicationRegistrationParams | Select -ExpandProperty value
+
+        Write-Host "Processing '$($applicationRegistrations.Count)' application registrations... (this may take a few minutes)"
+        $expectedRegistrations = Get-ExpectedApplicationRegistrationData $graphEnvironment $applicationRegistrations
+        $appIds = Get-AppIds $applicationRegistrations
+        Write-Verbose "Application IDs: $(ConvertTo-Json $appIds)" -Verbose
+        function Get-AppName($appId) { if ($name = $appIds.GetEnumerator() | Where Value -eq $appId | Select -First 1 -ExpandProperty Name) {$name} else {$appId} }
+        $anyChanges = $false
+        foreach ($applicationRegistration in $applicationRegistrations) {
+            if (-not ($expectedRegistration = $expectedRegistrations[$applicationRegistration.name])) {
+                $anyChanges = $true
+                $message = "Unexpected application registration '$($applicationRegistration.name)' found! [$(-not $Test)] Deleting this application registration..."
+                Write-Warning $message
+                Write-Verbose $message -Verbose
+                if (-not $Test) {
+                    $params = @{
+                        Method  = [Microsoft.PowerShell.Commands.WebRequestMethod]::Delete
+                        Headers = @{ Authorization = "Bearer $armAccessToken" }
+                        Uri     = "$($AdminResourceManagerEndpoint.ToString().TrimEnd('/'))$($applicationRegistration.id)?api-version=2015-11-01"
+                    }
+                    $response = Invoke-RestMethod @params -Verbose -ErrorAction Stop
+                }
+                continue
+            }
+
+            $changes = $false
+            $expectedAppRoleAssignments = $expectedRegistration.appRoleAssignments | Sort resource, client, roleId
+            $actualAppRoleAssignments = $applicationRegistration.Properties.appRoleAssignments | Sort resource, client, roleId
+            foreach ($expectedAppRoleAssignment in $expectedAppRoleAssignments) {
+                if (-not ($actualAppRoleAssignment = $actualAppRoleAssignments | Where { ($_.resource -eq $expectedAppRoleAssignment.resource) -and ($_.client -eq $expectedAppRoleAssignment.client) -and ($_.roleId -eq $expectedAppRoleAssignment.roleId) })) {
+                    $changes = $true
+                    $message = "Adding missing permission to application '$($applicationRegistration.name)' [$(-not $Test)]: $($expectedAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
+                    Write-Warning $message
+                    Write-Verbose $message -Verbose
+                }
+            }
+            foreach ($actualAppRoleAssignment in $actualAppRoleAssignments) {
+                if (-not ($expectedAppRoleAssignment = $expectedAppRoleAssignments | Where { ($_.resource -eq $actualAppRoleAssignment.resource) -and ($_.client -eq $actualAppRoleAssignment.client) -and ($_.roleId -eq $actualAppRoleAssignment.roleId) })) {
+                    $changes = $true
+                    $message = "Removing extra permission from application '$($applicationRegistration.name)' [$(-not $Test)]: $($actualAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
+                    Write-Warning $message
+                    Write-Verbose $message -Verbose
+                }
+            }
+
+            $expectedOAuth2PermissionGrants = $expectedRegistration.oAuth2PermissionGrants | Sort resource, client, scope
+            $actualOAuth2PermissionGrants = $applicationRegistration.Properties.oAuth2PermissionGrants | Sort resource, client, scope
+            foreach ($expectedOAuth2PermissionGrant in $expectedOAuth2PermissionGrants) {
+                if (-not ($actualOAuth2PermissionGrant = $actualOAuth2PermissionGrants | Where { ($_.resource -eq $expectedOAuth2PermissionGrant.resource) -and ($_.client -eq $expectedOAuth2PermissionGrant.client) -and ($_.scope -eq $expectedOAuth2PermissionGrant.scope) })) {
+                    $changes = $true
+                    $message = "Adding missing permission to application '$($applicationRegistration.name)' [$(-not $Test)]: $($expectedOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
+                    Write-Warning $message
+                    Write-Verbose $message -Verbose
+                }
+            }
+            foreach ($actualOAuth2PermissionGrant in $actualOAuth2PermissionGrants) {
+                if (-not ($expectedOAuth2PermissionGrant = $expectedOAuth2PermissionGrants | Where { ($_.resource -eq $actualOAuth2PermissionGrant.resource) -and ($_.client -eq $actualOAuth2PermissionGrant.client) -and ($_.scope -eq $actualOAuth2PermissionGrant.scope) })) {
+                    $changes = $true
+                    $message = "Removing extra permission from application '$($applicationRegistration.name)' [$(-not $Test)]: $($actualOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
+                    Write-Warning $message
+                    Write-Verbose $message -Verbose
+                }
+            }
+
+            if (-not $changes) {
+                Write-Verbose "No changes required for application registration '$($applicationRegistration.name)'" -Verbose
+            }
+            elseif (-not $Test) {
+                Write-Verbose "Updating application registration '$($applicationRegistration.name)'..." -Verbose
+                $applicationRegistration.Properties.appRoleAssignments = $expectedRegistration.appRoleAssignments
+                $applicationRegistration.Properties.oAuth2PermissionGrants = $expectedRegistration.oAuth2PermissionGrants
+                if ($expectedRegistration.tags) { $applicationRegistration.Properties.tags = $expectedRegistration.tags }
+                $params = @{
+                    Method      = [Microsoft.PowerShell.Commands.WebRequestMethod]::Put
+                    Headers     = @{ Authorization = "Bearer $armAccessToken" }
+                    Uri         = "$($AdminResourceManagerEndpoint.ToString().TrimEnd('/'))$($applicationRegistration.id)?api-version=2015-11-01"
+                    ContentType = 'application/json'
+                    Body        = ConvertTo-Json $applicationRegistration -Depth 4 -Compress
+                }
+                $response = Invoke-RestMethod @params -Verbose -ErrorAction Stop
+            }
+
+            if ($changes) { $anyChanges = $true }
+        }
+
+        if (-not $anyChanges) {
+            Write-Host "No required changes detected! The application registration resources are as expected!"
+        }
+        elseif ($Test) {
+            Write-Warning "Changes to application registrations detected! After reviewing, please run this command again with the parameter '-Test:`$false' to apply the changes. Note that some reported changes might be expected if you are not on the latest version of Azure Stack."
+        }
+        else {
+            Write-Host "All application registrations have been restored to their expected state!"
+        }
+    }
+
+    function Initialize-AzureRmEnvironment([string]$environmentName) {
+        $endpoints = Invoke-RestMethod -Method Get -Uri "$($AdminResourceManagerEndpoint.ToString().TrimEnd('/'))/metadata/endpoints?api-version=2015-01-01" -Verbose
+        Write-Verbose -Message "Endpoints: $(ConvertTo-Json $endpoints)" -Verbose
+
+        # resolve the directory tenant ID from the name
+        $directoryTenantId = (New-Object uri(Invoke-RestMethod "$($endpoints.authentication.loginEndpoint.TrimEnd('/'))/$DirectoryTenantName/.well-known/openid-configuration").token_endpoint).AbsolutePath.Split('/')[1]
+
+        $azureEnvironmentParams = @{
+            Name                                     = $environmentName
+            ActiveDirectoryEndpoint                  = $endpoints.authentication.loginEndpoint.TrimEnd('/') + "/"
+            ActiveDirectoryServiceEndpointResourceId = $endpoints.authentication.audiences[0]
+            AdTenant                                 = $directoryTenantId
+            ResourceManagerEndpoint                  = $AdminResourceManagerEndpoint
+            GalleryEndpoint                          = $endpoints.galleryEndpoint
+            GraphEndpoint                            = $endpoints.graphEndpoint
+            GraphAudience                            = $endpoints.graphEndpoint
+        }
+
+        $azureEnvironment = Add-AzureRmEnvironment @azureEnvironmentParams -ErrorAction Ignore
+        $azureEnvironment = Get-AzureRmEnvironment -Name $environmentName -ErrorAction Stop
+
+        return $azureEnvironment
+    }
+
+    function Initialize-AzureRmUserAccount([Microsoft.Azure.Commands.Profile.Models.PSAzureEnvironment]$azureStackEnvironment) {
+        $params = @{
+            EnvironmentName = $azureStackEnvironment.Name
+            TenantId        = $azureStackEnvironment.AdTenant
+        }
+
+        if ($AutomationCredential) {
+            $params += @{ Credential = $AutomationCredential }
+        }
+
+        # Prompts the user for interactive login flow if automation credential is not specified
+        $azureStackAccount = Add-AzureRmAccount @params
+
+        # Retrieve the refresh token
+        $tokens = @()
+        $tokens += try { [Microsoft.IdentityModel.Clients.ActiveDirectory.TokenCache]::DefaultShared.ReadItems()        } catch {}
+        $tokens += try { [Microsoft.Azure.Commands.Common.Authentication.AzureSession]::Instance.TokenCache.ReadItems() } catch {}
+        $refreshToken = $tokens |
+            Where Resource -EQ $azureStackEnvironment.ActiveDirectoryServiceEndpointResourceId |
+            Where IsMultipleResourceRefreshToken -EQ $true |
+            Where DisplayableId -EQ $azureStackAccount.Context.Account.Id |
+            Sort ExpiresOn |
+            Select -Last 1 -ExpandProperty RefreshToken |
+            ConvertTo-SecureString -AsPlainText -Force
+
+        # Workaround due to regression in AzurePowerShell profile module which fails to populate the response object of "Add-AzureRmAccount" cmdlet
+        if (-not $refreshToken) {
+            if ($tokens.Count -eq 1) {
+                Write-Warning "Failed to find target refresh token from Azure PowerShell Cache; attempting to reuse the single cached auth context..."
+                $refreshToken = $tokens[0].RefreshToken | ConvertTo-SecureString -AsPlainText -Force
+            }
+            else {
+                throw "Unable to find refresh token from Azure PowerShell Cache. Please try the command again in a fresh PowerShell instance after running 'Clear-AzureRmContext -Scope CurrentUser -Force -Verbose'."
+            }
+        }
+
+        return $refreshToken
+    }
+
+    function Resolve-GraphEnvironment([Microsoft.Azure.Commands.Profile.Models.PSAzureEnvironment]$azureEnvironment) {
+        $graphEnvironment = switch ($azureEnvironment.ActiveDirectoryAuthority) {
+            'https://login.microsoftonline.com/' { 'AzureCloud'        }
+            'https://login.chinacloudapi.cn/' { 'AzureChinaCloud'   }
+            'https://login-us.microsoftonline.com/' { 'AzureUSGovernment' }
+            'https://login.microsoftonline.de/' { 'AzureGermanCloud'  }
+
+            Default { throw "Unsupported graph resource identifier: $_" }
+        }
+
+        return $graphEnvironment
+    }
+
+    function Get-ArmAccessToken([Microsoft.Azure.Commands.Profile.Models.PSAzureEnvironment]$azureStackEnvironment) {
+        $armAccessToken = $null
+        $attempts = 0
+        $maxAttempts = 12
+        $delayInSeconds = 5
+        do {
+            try {
+                $attempts++
+                $armAccessToken = (Get-GraphToken -Resource $azureStackEnvironment.ActiveDirectoryServiceEndpointResourceId -UseEnvironmentData -ErrorAction Stop).access_token
+            }
+            catch {
+                if ($attempts -ge $maxAttempts) {
+                    throw
+                }
+                Write-Verbose "Error attempting to acquire ARM access token: $_`r`n$($_.Exception)" -Verbose
+                Write-Verbose "Delaying for $delayInSeconds seconds before trying again... (attempt $attempts/$maxAttempts)" -Verbose
+                Start-Sleep -Seconds $delayInSeconds
+            }
+        }
+        while (-not $armAccessToken)
+
+        return $armAccessToken
+    }
+
+    function Get-AppIds($applicationRegistrations) {
+        $appIds = @{
+            AzureCLI         = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
+            Graph            = '00000002-0000-0000-c000-000000000000'
+            PowerShell       = '1950a258-227b-4e31-a9cf-717495945fc2'
+            VisualStudio     = '872cd9fa-d31f-45e0-9eab-6e460a02d1f1'
+            VisualStudioCode = 'aebc6443-996d-45c2-90f0-388ff96faa56'
+        }
+        $applicationRegistrations | ForEach { $appIds[$_.name] = $_.Properties.appId }
+        return $appIds
+    }
+
+    function Get-ExpectedApplicationRegistrationData($graphEnvironment, $applicationRegistrations) {
+        $appIds = Get-AppIds $applicationRegistrations
+        return @{
+            AdminHubs              = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminHubs']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            AdminMonitoring        = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            AdminPolicy            = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminPolicy']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            AdminPortal            = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminPortal']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['AdminRbac']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            AdminRbac              = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminRbac']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminRbac']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['AdminRbac']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['AdminRbac']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminRbac']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            AdminResourceManager   = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        scope    = 'Directory.AccessAsUser.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        scope    = 'User.ReadBasic.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['AdminResourceManager']
+                        scope    = 'User.Read.All'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['VisualStudio']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['AzureCLI']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['VisualStudioCode']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['AdminResourceManager']
+                        client   = $appIds['AdminRbac']
+                        scope    = 'user_impersonation'
+                    }
+                )
+                tags                   = @('MicrosoftAzureStack')
+            }
+            AzureMonitorOboService = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            AzureMonitorOnboardRP  = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            AzureStackBridge       = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            CRP                    = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            Deployment             = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Deployment']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Deployment']
+                        roleId   = if ($graphEnvironment -eq 'AzureChinaCloud') { 'b55274d3-3582-44e3-83ae-ed7873d1111d' } else { '824c81eb-e3f8-4ee6-8f6d-de7f50d565b7' }
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            DeploymentProvider     = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['DeploymentProvider']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['DeploymentProvider']
+                        roleId   = if ($graphEnvironment -eq 'AzureChinaCloud') { 'b55274d3-3582-44e3-83ae-ed7873d1111d' } else { '824c81eb-e3f8-4ee6-8f6d-de7f50d565b7' }
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            DiskRP                 = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            FRPProviders           = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            Hubs                   = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Hubs']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            IBC                    = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            KeyVault               = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['KeyVault']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['VisualStudio']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['VisualStudioCode']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['AzureCLI']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            KeyVaultInternal       = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['KeyVaultInternal']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['AdminPortal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['VisualStudio']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['VisualStudioCode']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVaultInternal']
+                        client   = $appIds['AzureCLI']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            Monitoring             = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @()
+            }
+            Policy                 = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Policy']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @()
+            }
+            Portal                 = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Portal']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Portal']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Portal']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['Rbac']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['KeyVault']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            Rbac                   = @{
+                appRoleAssignments     = @()
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Rbac']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['Rbac']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['Rbac']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['Rbac']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['Rbac']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    }
+                )
+            }
+            ResourceManager        = @{
+                appRoleAssignments     = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        roleId   = '5778995a-e1bf-45b8-affa-663a9f3f4d04'
+                    }
+                )
+                oAuth2PermissionGrants = @(
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        scope    = 'Directory.Read.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        scope    = 'Directory.AccessAsUser.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        scope    = 'User.Read'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        scope    = 'User.ReadBasic.All'
+                    },
+                    @{
+                        resource = $appIds['Graph']
+                        client   = $appIds['ResourceManager']
+                        scope    = 'User.Read.All'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['PowerShell']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['VisualStudio']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['AzureCLI']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['VisualStudioCode']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['Rbac']
+                        scope    = 'user_impersonation'
+                    },
+                    @{
+                        resource = $appIds['ResourceManager']
+                        client   = $appIds['Portal']
+                        scope    = 'user_impersonation'
+                    }
+                )
+                tags                   = @('MicrosoftAzureStack')
+            }
+        }
+    }
+
+    $logFile = Join-Path -Path $PSScriptRoot -ChildPath "Repair.$DirectoryTenantName.$(Get-Date -Format MM-dd_HH-mm-ss_ms).log"
+    Write-Verbose "Logging additional information to log file '$logFile'" -Verbose
+
+    $logStartMessage = "[$(Get-Date -Format 'hh:mm:ss tt')] - Beginning invocation of '$($MyInvocation.InvocationName)' with parameters: $(ConvertTo-Json $PSBoundParameters -Depth 4)"
+    $logStartMessage >> $logFile
+
+    try {
+        # Redirect verbose output to a log file
+        Invoke-Main 4>> $logFile
+
+        $logEndMessage = "[$(Get-Date -Format 'hh:mm:ss tt')] - Script completed successfully."
+        $logEndMessage >> $logFile
+    }
+    catch {
+        $logErrorMessage = "[$(Get-Date -Format 'hh:mm:ss tt')] - Script terminated with error: $_`r`n$($_.Exception)"
+        $logErrorMessage >> $logFile
+        Write-Warning "An error has occurred; more information may be found in the log file '$logFile'" -WarningAction Continue
+        throw
+    }
+}
+
+<#
+.Synopsis
 Adds a Guest Directory Tenant to Azure Stack.
 .DESCRIPTION
 Running this cmdlet will add the specified directory tenant to the Azure Stack whitelist.    
@@ -287,23 +1044,22 @@ function Update-AzsHomeDirectoryTenant {
             Write-Host "Installing Application... ($($count) of $($applicationRegistrations.Count)): $($applicationServicePrincipal.appId) '$($applicationServicePrincipal.appDisplayName)'"
 
             # WORKAROUND - the recent Azure Stack update has a missing permission registration; temporarily "inject" this permission registration into the returned data
-            if ($applicationServicePrincipal.servicePrincipalNames | Where { $_ -like 'https://deploymentprovider.*/*' })
-            {
+            if ($applicationServicePrincipal.servicePrincipalNames | Where { $_ -like 'https://deploymentprovider.*/*' }) {
                 Write-Verbose "Adding missing permission registrations for application '$($applicationServicePrincipal.appDisplayName)' ($($applicationServicePrincipal.appId))..." -Verbose
 
                 $graph = Get-GraphApplicationServicePrincipal -ApplicationId (Get-GraphEnvironmentInfo).Applications.WindowsAzureActiveDirectory.Id
 
                 $applicationRegistration.appRoleAssignments = @(
                     [pscustomobject]@{
-                        resource   = (Get-GraphEnvironmentInfo).Applications.WindowsAzureActiveDirectory.Id
-                        client     = $applicationRegistration.appId
-                        roleId     = $graph.appRoles | Where value -EQ 'Directory.Read.All' | Select -ExpandProperty id
+                        resource = (Get-GraphEnvironmentInfo).Applications.WindowsAzureActiveDirectory.Id
+                        client   = $applicationRegistration.appId
+                        roleId   = $graph.appRoles | Where value -EQ 'Directory.Read.All' | Select -ExpandProperty id
                     },
 
                     [pscustomobject]@{
-                        resource   = (Get-GraphEnvironmentInfo).Applications.WindowsAzureActiveDirectory.Id
-                        client     = $applicationRegistration.appId
-                        roleId     = $graph.appRoles | Where value -EQ 'Application.ReadWrite.OwnedBy' | Select -ExpandProperty id
+                        resource = (Get-GraphEnvironmentInfo).Applications.WindowsAzureActiveDirectory.Id
+                        client   = $applicationRegistration.appId
+                        roleId   = $graph.appRoles | Where value -EQ 'Application.ReadWrite.OwnedBy' | Select -ExpandProperty id
                     }
                 )
             }
@@ -1175,11 +1931,12 @@ function Unregister-AzsWithMyDirectoryTenant {
 }
 
 Export-ModuleMember -Function @(
-    "Register-AzsGuestDirectoryTenant",
+    "Repair-AzsApplicationRegistrations",
     "Update-AzsHomeDirectoryTenant",
+    "Register-AzsGuestDirectoryTenant",
     "Register-AzsWithMyDirectoryTenant",
-    "Unregister-AzsGuestDirectoryTenant",
     "Unregister-AzsWithMyDirectoryTenant",
+    "Unregister-AzsGuestDirectoryTenant",
     "Get-AzsDirectoryTenantidentifier",
     "New-AzsADGraphServicePrincipal"
 )
