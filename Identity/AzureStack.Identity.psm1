@@ -108,19 +108,16 @@ function Repair-AzsApplicationRegistrations {
         [ValidateNotNull()]
         [pscredential] $AutomationCredential = $null,
 
-        # Indicates whether the script should only test if the application registration permissions are as-expected, without changing them. Run this command with "-Test:$false" to have it correct the changes it reports from running it without this modifier.
+        # Indicates whether the script should correct any changes identified in the application registration permissions, or just report what changes are detected.
         [Parameter()]
-        [switch] $Test = $true
+        [switch] $Force
     )
 
     $ErrorActionPreference = 'Stop'
     $VerbosePreference = 'Continue'
 
-    if (-not $Test) {
-        Write-Warning -WarningAction Inquire -Message "This script makes changes to the advertised application permissions within Azure Stack. This is a temporary workaround to address certain circumstances which can result in modifications to these resources within Azure Stack. Only run this script if you have been directed to do so or have an understanding of the modifications this script addresses. Are you sure you want to proceed?"
-    }
-    else {
-        Write-Warning "This script has been executed with the default parameter '-Test:`$true' which will only report if any changes are detected to application registrations which can arise in certain circumstances when running an Azure Stack update. After reviewing the changes it reports, run the script again with the parameter '-Test:`$false' to apply the changes."
+    if ($Force) {
+        Write-Warning -WarningAction Inquire -Message "This script makes changes to the advertised application permissions within Azure Stack (if necessary). This is a temporary workaround to address certain circumstances which can result in modifications to these resources within Azure Stack. Only run this script if you have been directed to do so or have an understanding of the modifications this script addresses. Are you sure you want to proceed?"
     }
 
     # Install-Module AzureRm
@@ -159,10 +156,11 @@ function Repair-AzsApplicationRegistrations {
         foreach ($applicationRegistration in $applicationRegistrations) {
             if (-not ($expectedRegistration = $expectedRegistrations[$applicationRegistration.name])) {
                 $anyChanges = $true
-                $message = "Unexpected application registration '$($applicationRegistration.name)' found! [$(-not $Test)] Deleting this application registration..."
+                $message = "Unexpected application registration '$($applicationRegistration.name)' found! This registration can be deleted."
+                if ($Force) { $message += "Deleting application registration..." }
                 Write-Warning $message
                 Write-Verbose $message -Verbose
-                if (-not $Test) {
+                if ($Force) {
                     $params = @{
                         Method  = [Microsoft.PowerShell.Commands.WebRequestMethod]::Delete
                         Headers = @{ Authorization = "Bearer $armAccessToken" }
@@ -179,7 +177,7 @@ function Repair-AzsApplicationRegistrations {
             foreach ($expectedAppRoleAssignment in $expectedAppRoleAssignments) {
                 if (-not ($actualAppRoleAssignment = $actualAppRoleAssignments | Where { ($_.resource -eq $expectedAppRoleAssignment.resource) -and ($_.client -eq $expectedAppRoleAssignment.client) -and ($_.roleId -eq $expectedAppRoleAssignment.roleId) })) {
                     $changes = $true
-                    $message = "Adding missing permission to application '$($applicationRegistration.name)' [$(-not $Test)]: $($expectedAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
+                    $message = "Permission missing for application '$($applicationRegistration.name)': $($expectedAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
                     Write-Warning $message
                     Write-Verbose $message -Verbose
                 }
@@ -187,7 +185,7 @@ function Repair-AzsApplicationRegistrations {
             foreach ($actualAppRoleAssignment in $actualAppRoleAssignments) {
                 if (-not ($expectedAppRoleAssignment = $expectedAppRoleAssignments | Where { ($_.resource -eq $actualAppRoleAssignment.resource) -and ($_.client -eq $actualAppRoleAssignment.client) -and ($_.roleId -eq $actualAppRoleAssignment.roleId) })) {
                     $changes = $true
-                    $message = "Removing extra permission from application '$($applicationRegistration.name)' [$(-not $Test)]: $($actualAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
+                    $message = "Extra permission found for application '$($applicationRegistration.name)': $($actualAppRoleAssignment | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='roleId';e={$_.roleId}} | ConvertTo-Json -Compress)"
                     Write-Warning $message
                     Write-Verbose $message -Verbose
                 }
@@ -198,7 +196,7 @@ function Repair-AzsApplicationRegistrations {
             foreach ($expectedOAuth2PermissionGrant in $expectedOAuth2PermissionGrants) {
                 if (-not ($actualOAuth2PermissionGrant = $actualOAuth2PermissionGrants | Where { ($_.resource -eq $expectedOAuth2PermissionGrant.resource) -and ($_.client -eq $expectedOAuth2PermissionGrant.client) -and ($_.scope -eq $expectedOAuth2PermissionGrant.scope) })) {
                     $changes = $true
-                    $message = "Adding missing permission to application '$($applicationRegistration.name)' [$(-not $Test)]: $($expectedOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
+                    $message = "Permission missing for application '$($applicationRegistration.name)': $($expectedOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
                     Write-Warning $message
                     Write-Verbose $message -Verbose
                 }
@@ -206,7 +204,7 @@ function Repair-AzsApplicationRegistrations {
             foreach ($actualOAuth2PermissionGrant in $actualOAuth2PermissionGrants) {
                 if (-not ($expectedOAuth2PermissionGrant = $expectedOAuth2PermissionGrants | Where { ($_.resource -eq $actualOAuth2PermissionGrant.resource) -and ($_.client -eq $actualOAuth2PermissionGrant.client) -and ($_.scope -eq $actualOAuth2PermissionGrant.scope) })) {
                     $changes = $true
-                    $message = "Removing extra permission from application '$($applicationRegistration.name)' [$(-not $Test)]: $($actualOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
+                    $message = "Extra permission found for application '$($applicationRegistration.name)': $($actualOAuth2PermissionGrant | Select @{n='resource';e={Get-AppName $_.resource}},@{n='client';e={Get-AppName $_.client}},@{n='scope';e={$_.scope}} | ConvertTo-Json -Compress)"
                     Write-Warning $message
                     Write-Verbose $message -Verbose
                 }
@@ -215,8 +213,10 @@ function Repair-AzsApplicationRegistrations {
             if (-not $changes) {
                 Write-Verbose "No changes required for application registration '$($applicationRegistration.name)'" -Verbose
             }
-            elseif (-not $Test) {
-                Write-Verbose "Updating application registration '$($applicationRegistration.name)'..." -Verbose
+            elseif ($Force) {
+                $message = "Updating application registration '$($applicationRegistration.name)'..."
+                WRite-Host $message
+                Write-Verbose $message -Verbose
                 $applicationRegistration.Properties.appRoleAssignments = $expectedRegistration.appRoleAssignments
                 $applicationRegistration.Properties.oAuth2PermissionGrants = $expectedRegistration.oAuth2PermissionGrants
                 if ($expectedRegistration.tags) { $applicationRegistration.Properties.tags = $expectedRegistration.tags }
@@ -234,13 +234,13 @@ function Repair-AzsApplicationRegistrations {
         }
 
         if (-not $anyChanges) {
-            Write-Host "No required changes detected! The application registration resources are as expected!"
+            Write-Host "No required changes detected! The application registration resources are as expected!" -ForegroundColor Green
         }
-        elseif ($Test) {
-            Write-Warning "Changes to application registrations detected! After reviewing, please run this command again with the parameter '-Test:`$false' to apply the changes. Note that some reported changes might be expected if you are not on the latest version of Azure Stack."
+        elseif (-not $Force) {
+            Write-Warning "`r`nChanges to application registrations detected!`r`nAfter reviewing, please run this command again with the parameter '-Force' to fix the detected changes.`r`nNote that some reported changes might be expected if you are not on the latest version of Azure Stack."
         }
         else {
-            Write-Host "All application registrations have been restored to their expected state!"
+            Write-Host "All application registrations have been restored to their expected state!" -ForegroundColor Green
         }
     }
 
