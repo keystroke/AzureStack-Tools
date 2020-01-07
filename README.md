@@ -21,21 +21,24 @@ To use these tools, obtain Azure Stack compatible Azure PowerShell module. Unles
 
 For PowerShell, install the following:
 
-For Azure stack 1808 or later
+For Azure Stack 1904 to 1907
+
+Install the AzureRM.BootStrapper module. Select Yes when prompted to install NuGet
+Install-Module -Name AzureRM.BootStrapper
+
+Install and import the API Version Profile required by Azure Stack into the current PowerShell session.
+Use-AzureRmProfile -Profile 2019-03-01-hybrid -Force
+Install-Module -Name AzureStack -RequiredVersion 1.7.2
+
+For Azure stack 1901 to 1903
 
 ```powershell
-Install-Module -Name 'AzureRm.Bootstrapper'
-Install-AzureRmProfile -profile '2018-03-01-hybrid' -Force
-Install-Module -Name AzureStack -RequiredVersion 1.5.0
+Install-Module -Name AzureRM -RequiredVersion 2.4.0
+Install-Module -Name AzureStack -RequiredVersion 1.7.1
 ```
 
-For azure stack 1807 or earlier
+For all other azure stack versions, please follow the instructions at https://aka.ms/azspsh for the needed azure powershell
 
-```powershell
-Install-Module -Name 'AzureRm.Bootstrapper'
-Install-AzureRmProfile -profile '2017-03-09-profile' -Force
-Install-Module -Name AzureStack -RequiredVersion 1.4.0
-```
 
 Obtain the tools by cloning the git repository.
 
